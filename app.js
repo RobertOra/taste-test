@@ -1,19 +1,19 @@
-// Taste Test page: reads Spotify files, scores them with engine.js in the browser (reference data read by byte range), renders the report.
-import { scoreHistory, monthLabel, Pack } from './engine.js';
+// Taste Test page: reads Spotify and/or YouTube (Google Takeout) files, scores them with engine.js in the browser (reference data read by byte range), renders the report.
+import { scoreHistory, monthLabel, Pack, WANT } from './engine.js?v=e3d3853e75';
 
 const $ = (s) => document.querySelector(s);
 let META = null;
-const metaReady = fetch('data/meta.json').then((r) => r.json()).then((m) => (META = m));
-const fetchIndex = () => fetch('data/index.bin').then((r) => r.arrayBuffer());
+const metaReady = fetch('data/meta.json?v=e3d3853e75').then((r) => r.json()).then((m) => (META = m));
+const fetchIndex = () => fetch('data/index.bin?v=e3d3853e75').then((r) => r.arrayBuffer());
 async function fetchRange(file, start, end) {
-  const r = await fetch(`data/p/${String(file).padStart(2, '0')}.bin`, { headers: { Range: `bytes=${start}-${end}` } });
+  const r = await fetch(`data/p/${String(file).padStart(2, '0')}.bin?v=e3d3853e75`, { headers: { Range: `bytes=${start}-${end}` } });
   const b = new Uint8Array(await r.arrayBuffer());
   return r.status === 206 ? b : b.subarray(start, end + 1);   // a server without range support sends the whole file
 }
 
 // ---------- input
 async function readEntries(entry, out) {
-  if (entry.isFile) { if (/\.(zip|json)$/i.test(entry.name)) out.push(await new Promise((res, rej) => entry.file(res, rej))); return; }
+  if (entry.isFile) { if (/\.(zip|json|html)$/i.test(entry.name)) { const f = await new Promise((res, rej) => entry.file(res, rej)); f._path = entry.fullPath; out.push(f); } return; }
   const reader = entry.createReader(); let batch;
   do { batch = await new Promise((res, rej) => reader.readEntries(res, rej)); for (const e of batch) await readEntries(e, out); } while (batch.length);
 }
@@ -23,31 +23,71 @@ function status(msg, { err = false, progress = null } = {}) {
   s.firstChild.textContent = msg;
   if (progress !== null) s.querySelector('.bar i').style.width = `${Math.round(progress * 100)}%`;
 }
-async function run(fileList) {
-  const files = [...fileList].filter((f) => /\.(zip|json)$/i.test(f.name));
-  if (!files.length) return status('No Spotify files found. Look for files named Streaming_History_Audio_….json, or the zip that contains them.', { err: true });
+const inFolder = (f) => f._path || f.webkitRelativePath || '';   // from a folder, open only Spotify histories and YouTube files (a full Takeout holds much else)
+const usable = (fs) => [...fs].filter((f) => /\.zip$/i.test(f.name) || (/\.(json|html)$/i.test(f.name) && (!inFolder(f) || WANT(inFolder(f)))));
+const SRC = { spotify: { label: 'Spotify', files: [] }, youtube: { label: 'YouTube', files: [] } };
+function showSources() {
+  for (const [k, v] of Object.entries(SRC)) {
+    const el = document.querySelector(`.drop[data-src="${k}"]`), st = el.querySelector('.src-state');
+    el.classList.toggle('has', v.files.length > 0);
+    st.innerHTML = v.files.length ? `✓ ${v.files.length === 1 ? esc(v.files[0].name) : `${v.files.length} files`} <a href="#" data-clear="${k}">remove</a>` : 'Not added';
+  }
+  document.querySelectorAll('[data-clear]').forEach((x) => (x.onclick = (e) => { e.preventDefault(); e.stopPropagation(); SRC[x.dataset.clear].files = []; showSources(); }));
+  $('#run').disabled = !SRC.spotify.files.length && !SRC.youtube.files.length;
+}
+function addFiles(k, fs) {
+  const got = usable(fs);
+  if (!got.length) return status(k === 'spotify' ? 'No Spotify files found there. Look for Streaming_History_Audio_….json, or the zip that contains them.'
+    : 'No YouTube files found there. Look for the Google Takeout zip, MyActivity.html or watch-history.html.', { err: true });
+  $('#status').hidden = true; SRC[k].files = got; showSources();
+}
+for (const el of document.querySelectorAll('.drop[data-src]')) {
+  const k = el.dataset.src;
+  ['dragenter', 'dragover'].forEach((t) => el.addEventListener(t, (e) => { e.preventDefault(); el.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach((t) => el.addEventListener(t, (e) => { e.preventDefault(); el.classList.remove('over'); }));
+  el.addEventListener('drop', async (e) => {
+    const items = [...e.dataTransfer.items].map((i) => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+    if (items.length) { const files = []; for (const it of items) await readEntries(it, files); addFiles(k, files); } else addFiles(k, [...e.dataTransfer.files]);
+  });
+  el.querySelectorAll('input[type=file]').forEach((inp) => inp.addEventListener('change', (e) => { addFiles(k, [...e.target.files]); e.target.value = ''; }));
+}
+
+// score every combination given (both together, and each alone when there are two), sharing one cache of reference lookups
+let VIEWS = [];
+async function run(sources = SRC) {
+  const given = Object.entries(sources).filter(([, v]) => v.files.length);
+  if (!given.length) return;
+  const combos = given.length > 1 ? [['both', 'Spotify + YouTube', given.flatMap(([, v]) => v.files)], ...given.map(([k, v]) => [k, `${v.label} only`, v.files])]
+    : [[given[0][0], given[0][1].label, given[0][1].files]];
   try {
     $('#report').hidden = true;
     status('Reading your files…');
-    const data = await Promise.all(files.map(async (f) => ({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) })));
     await metaReady;
-    status('Looking up the music you got into…', { progress: 0 });
     const pack = new Pack(META, fetchIndex, fetchRange);
-    const r = await scoreHistory(data, META, pack, (x) => status('Looking up the music you got into…', { progress: x }));
-    if (!r.ok) return status((r.checks || []).filter((c) => !c.ok).map((c) => c.text).join(' ') || 'We couldn\'t score these files.', { err: true });
+    VIEWS = [];
+    for (const [i, [key, label, fs]] of combos.entries()) {
+      const msg = `Looking up the music you got into${combos.length > 1 ? ` (${label}, ${i + 1} of ${combos.length})` : ''}…`;
+      status(msg, { progress: 0 });
+      const data = await Promise.all(fs.map(async (f) => (/\.zip$/i.test(f.name) ? { name: f.name, blob: f } : { name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) })));   // zips are read in pieces
+      VIEWS.push({ key, label, r: await scoreHistory(data, META, pack, (x) => status(msg, { progress: x })) });
+    }
+    const first = VIEWS.find((v) => v.r.ok);
+    if (!first) return status(VIEWS.map((v) => (VIEWS.length > 1 ? `${v.label}: ` : '') + ((v.r.checks || []).filter((c) => !c.ok).map((c) => c.text).join(' ') || "we couldn't score these files.")).join(' '), { err: true });
     $('#status').hidden = true;
-    render(r);
+    show(first.key, true);
   } catch (e) { console.error(e); status(`Something went wrong reading these files: ${e.message || e}`, { err: true }); }
 }
-const drop = $('#drop');
-['dragenter', 'dragover'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add('over'); }));
-['dragleave', 'drop'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
-drop.addEventListener('drop', async (e) => {
-  const items = [...e.dataTransfer.items].map((i) => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
-  if (items.length) { const files = []; for (const it of items) await readEntries(it, files); run(files); } else run([...e.dataTransfer.files]);
-});
-$('#pick-files').addEventListener('change', (e) => run([...e.target.files]));
-$('#pick-folder').addEventListener('change', (e) => run([...e.target.files]));
+$('#run').addEventListener('click', () => run());
+function show(key, scroll = false) {
+  const v = VIEWS.find((x) => x.key === key);
+  render(v.r, scroll);
+  if (VIEWS.length < 2) return;
+  const why = (x) => esc((x.r.checks || []).filter((c) => !c.ok).map((c) => c.text).join(' '));
+  $('#report').insertAdjacentHTML('afterbegin', `<div class="views"><span class="label">Scored from</span>${VIEWS.map((x) => x.r.ok
+    ? `<button class="btn small${x.key === key ? '' : ' ghost'}" data-view="${x.key}">${x.label} · ${x.r.measures[x.r.headline].percentile}%</button>`
+    : `<button class="btn small ghost" disabled title="${why(x)}">${x.label} · can't score</button>`).join('')}</div>`);
+  document.querySelectorAll('[data-view]').forEach((b) => (b.onclick = () => show(b.dataset.view)));
+}
 
 // ---------- formatting
 const pct = (x, d = 0) => (x >= 0 ? '+' : '−') + Math.abs(100 * x).toFixed(d) + '%';
@@ -63,6 +103,8 @@ const MEAS = {
   artist_A: { title: 'Finding artists before they take off', short: 'Artists that take off', what: 'artists', verb: 'gained', of: 'new listeners than similar artists found the same month' },
   artist_D: { title: 'Finding artists people stick with', short: 'Artists people stick with', what: 'artists', verb: 'kept', of: 'more of the people who tried them than similar artists' },
 };
+const songsWord = (m) => `${n(m.items ? m.items.length : m.picks)} songs`;
+const groupNote = (m) => ` (${n(m.picks)} independent finds: songs by one artist found in the same month count as one)`;
 const win = (m) => (m.window ? `${monthLabel(m.window[0])} – ${monthLabel(m.window[1])}` : '');
 
 function distChart(score, lo, hi, ref) {
@@ -91,7 +133,7 @@ function rangeBar(m) {   // a small 0-100 bar with the likely range and the poin
 }
 
 // ---------- report
-function render(r) {
+function render(r, scroll = true) {
   const M = r.measures, H = M[r.headline], hm = MEAS[r.headline], Rp = r.report;
   const ref = META.measures[r.headline].scores;
   const qs = (p) => ref[Math.min(ref.length - 1, Math.max(0, Math.round(p / 100 * (ref.length - 1))))];
@@ -101,23 +143,22 @@ function render(r) {
         <div class="big">${H.percentile}%<small>of listeners beaten</small></div>
         <p class="meaning">You're better than <b>${H.percentile}%</b> of listeners at <b>${hm.title.toLowerCase()}</b>. The ${hm.what} you got into ${hm.verb}
           <b class="${cls(H.growth)}">${pct(H.growth, 1)}</b> ${hm.of}.</p>
-        <p class="meaning">Your true rank is most likely between the <b>${ord(H.range[0])}</b> and <b>${ord(H.range[1])}</b> percentile.</p>${warn}</div>
+        <p class="meaning">Your true rank is most likely between the <b>${ord(H.range[0])}</b> and <b>${ord(H.range[1])}</b> percentile (80% confidence interval).</p>${warn}</div>
       <div>${distChart(H.score, qs(H.range[0]), qs(H.range[1]), ref)}
-        <p class="note">Gray bars: ${n(ref.length)} ListenBrainz listeners scored the same way. Blue band: your likely range. Based on ${n(H.picks)} ${hm.what === 'songs' ? 'groups of songs' : 'artists'} you got into, ${win(H)}.</p></div>
+        <p class="note">Gray bars: ${n(ref.length)} ListenBrainz listeners scored the same way. Blue band: your likely range (80% confidence interval). Based on ${hm.what === 'songs' ? songsWord(H) : `${n(H.picks)} artists`} you got into, ${win(H)}${hm.what === 'songs' ? groupNote(H) : ''}.</p></div>
     </div></section>`;
 
   const F = Rp.facts;
   const facts = `<div class="facts" style="margin:16px 0">
-    <div class="fact"><b>${n(F.plays)}</b><span>plays over ${F.years} years</span></div>
-    <div class="fact"><b>${n(F.findsS)}</b><span>songs you really got into</span></div>
-    <div class="fact"><b>${n(F.findsA)}</b><span>artists you really got into (about ${F.perYear} a year)</span></div>
-    ${Rp.tookOff ? `<div class="fact"><b>${Rp.tookOff.yours} <span style="font-size:15px;color:var(--ink-3)">vs ${Rp.tookOff.expected} typical</span></b><span>of your scored artists took off (3× the new listeners a year later)</span></div>` : ''}
+    <div class="fact"><b>${n(F.plays)} plays</b><span>over ${F.years} years${F.ytPlays && F.ytPlays < F.plays ? ` (${n(F.ytPlays)} on YouTube)` : ''}</span></div>
+    <div class="fact"><b>${n(F.findsS)} songs</b><span>you really got into (played in 4+ separate weeks, the 4th within 6 months of first hearing)${M.song_A.items ? `; ${n(M.song_A.items.length)} matched and scored` : ''}</span></div>
+    <div class="fact"><b>${n(F.findsA)} artists</b><span>you really got into (about ${F.perYear} a year; same rule, any of their songs)${M.artist_A.picks ? `; ${n(M.artist_A.picks)} matched and scored` : ''}</span></div>
+    ${Rp.tookOff ? `<div class="fact"><b style="line-height:1.25">${Rp.tookOff.yours} took off <span style="font-size:15px;color:var(--ink-3)">vs ${Rp.tookOff.expected} typical</span></b><span>of your scored ${hm.what} (3× the new listeners a year later)</span></div>` : ''}
   </div>`;
 
   const pts = (x) => `${x >= 0 ? '+' : '−'}${Math.abs(100 * x).toFixed(1)} points`;
   const detail = (k) => {
     const m = M[k], d = MEAS[k], typ = META.measures[k].typical_avg, A = k.endsWith('A');
-    const unitWord = k.startsWith('song') ? 'groups of songs' : 'artists';
     if (!m.picks) return '<p class="muted">No finds we could judge.</p>';
     const yours = A ? `Your finds gained <b class="${cls(m.growth)}">${pct(m.growth, 1)}</b> new listeners compared with similar ${d.what} found the same month; the typical listener's finds: <b>${pct(Math.expm1(typ), 1)}</b>.`
       : `People who tried your finds kept playing them <b class="${cls(m.growth)}">${pts(m.growth)}</b> ${m.growth >= 0 ? 'more' : 'less'} often than for similar ${d.what}; for the typical listener's finds: <b>${pts(typ)}</b>.`;
@@ -126,14 +167,14 @@ function render(r) {
       <td class="num nowrap">${A ? `${n(x.a0)} → ${n(x.a1)}` : `${n(x.kept)} of ${n(x.tried)} kept it`}</td>
       <td class="num nowrap ${cls(x.excess)}">${A ? pct(Math.expm1(x.excess)) : pts(x.excess)}</td></tr>`;
     const best = m.items.slice(0, 5), worst = m.items.slice(-5).reverse();
-    return `<p style="margin:4px 0 10px">${yours} Based on ${n(m.picks)} ${unitWord} you got into${m.window ? ` (${win(m)})` : ''}${m.enough ? '' : `; we need ${META.min_picks} for a score`}.</p>
+    return `<p style="margin:4px 0 10px">${yours} Based on ${k.startsWith('song') ? songsWord(m) : `${n(m.picks)} artists`} you got into${m.window ? `, ${win(m)}` : ''}${k.startsWith('song') ? groupNote(m) : ''}${m.enough ? '' : `; we need ${META.min_picks} for a score`}.</p>
       <div class="tablewrap"><table class="bw">
         <tr><th>Your best ${d.what}</th><th>Found</th><th class="num">${A ? 'New listeners then → a year later' : 'Of those who tried it'}</th><th class="num">vs similar</th></tr>${best.map(line).join('')}
         <tr><th style="padding-top:16px">Your worst ${d.what}</th><th></th><th></th><th></th></tr>${worst.map(line).join('')}</table></div>
       <p class="note">${A ? 'New listeners: ListenBrainz listeners who first played it in the six months up to your find, and in the same six months a year later. The last column is compared with similar finds (same month, size, momentum, scene, age and release timing).'
         : 'Of the people who first tried it in the year after your find (past their own first six months of listening), how many kept playing it. The last column is compared with similar finds.'}</p>`;
   };
-  const all = card('All four kinds of taste', 'The study measured taste a few ways; these are the ones we can score from a Spotify history. Songs are the strongest measure. Click a row for your numbers and your best and worst finds.',
+  const all = card('All four kinds of taste', 'The study measured taste a few ways; these are the ones we can score from a listening history. Songs are the strongest measure. Click a row for your numbers and your best and worst finds.',
     `<table class="mtable"><tr><th></th><th class="num">Better than</th><th>Likely range</th><th class="num hide-sm">Finds</th></tr>
     ${Object.entries(MEAS).map(([k, d]) => { const m = M[k]; return `<tr class="mrow${k === r.headline ? ' hl' : ''}" data-k="${k}" style="cursor:pointer"><td><b>${d.short}</b> <span class="muted">▸</span><div class="muted" style="font-size:13px">${k.endsWith('A') ? 'Prescience: your finds gained new listeners' : 'Discernment: people who tried your finds kept playing them'}</div></td>
       <td class="num"><b>${m.enough ? m.percentile + '%' : '–'}</b></td><td style="min-width:140px">${rangeBar(m)}${m.enough ? `<div class="muted" style="font-size:12.5px">${ord(m.range[0])}–${ord(m.range[1])}</div>` : ''}</td>
@@ -152,7 +193,7 @@ function render(r) {
     <p class="meaning">On average, ${Math.round(A.share * 100)}% of each artist's ListenBrainz fans got into them <b>after</b> you did (across ${n(A.artists)} artists that took off since 2015).</p>
     ${A.best.length ? `<div class="calls">${A.best.map((b) => `<div class="call"><b>${esc(b.name)}</b><span>you got into them in ${monthLabel(b.m)},<br>before ${Math.round(b.share * 100)}% of their ${n(b.fans)} fans</span></div>`).join('')}</div>` : ''}`);
   const sure = card('How sure is this?', null, `<div class="facts">
-    <div class="fact"><b>${n(H.picks)}</b><span>${hm.what === 'songs' ? 'groups of songs' : 'artists'} scored (all your judged finds since 2016)</span></div>
+    <div class="fact"><b>${n(H.picks)}</b><span>${hm.what === 'songs' ? `independent song finds scored (from ${n(H.items.length)} songs; songs by one artist found in the same month count as one)` : 'artists scored'} (all your judged finds since 2016)</span></div>
     <div class="fact"><b>${ord(H.range[0])}–${ord(H.range[1])}</b><span>likely range of your rank (80%)</span></div>
     <div class="fact"><b>${H.reliability.toFixed(2)}</b><span>reliability with this much history (1 = perfectly repeatable)</span></div>
     <div class="fact"><b>${Math.round(r.history.matched.songs * 100)}% / ${Math.round(r.history.matched.artists * 100)}%</b><span>of your songs / artists were in the reference data</span></div></div>
@@ -163,10 +204,10 @@ function render(r) {
   const conv = card('Conviction', 'Artists you got into, grouped by how many times you played them in their first six months.',
     signedBars(Rp.conviction.map((c) => ({ label: `${c.label} <span class="muted">(${c.hi === null ? c.lo + '+' : c.lo + '–' + c.hi})</span>`, v: c.finds >= 5 ? c.growth : null, note: `${n(c.finds)} artists` }))));
   const years = `<section class="card"><h2>Your taste over time</h2>
-    <p class="sub">Your percentile from each year's finds, with its likely range (years with fewer than ${META.min_year} finds aren't scored). Single years rest on fewer finds,
+    <p class="sub">Your percentile from each year's finds, with its likely range (years with fewer than 5 finds aren't scored; hollow points have under ${META.min_year}, so their ranges are wide). Single years rest on fewer finds,
       so their ranges are wider. Taste drifts: in the study, it faded over about a decade.</p>
     <div class="tablebar" id="tchips"></div><div id="tchart"></div><p class="note" id="tnote"></p></section>`;
-  const how = Rp.how.length > 1 ? card('How you found them', 'How the first play of each artist started, from your Spotify data.',
+  const how = Rp.how.length > 1 ? card('How you found them', 'How the first play of each artist started.',
     signedBars(Rp.how.map((h) => ({ label: h.label, v: h.finds >= 5 ? h.growth : null, note: `${n(h.finds)} artists` })))) : '';
 
   const big = [...Rp.findsA].sort((a, b) => b.extra - a.extra).slice(0, 10);
@@ -210,7 +251,7 @@ function render(r) {
     tr.querySelector('.muted').textContent = d.hidden ? '▸' : '▾';
   }));
   $('#again').onclick = (e) => { e.preventDefault(); $('#report').hidden = true; window.scrollTo(0, 0); };
-  $('#report').scrollIntoView();
+  if (scroll) $('#report').scrollIntoView();
 }
 
 // every scored find, by impact (songs or artists)
@@ -253,7 +294,7 @@ function wirePicks(Rp) {
 }
 
 window.__render = (r) => { META = META || window.__meta; render(r); };   // local page tests
-window.__run = run;
+window.__run = (sources) => run(sources);
 
 // your taste over time: yearly percentile with its range, one measure at a time
 function wireTime(M, head) {
@@ -273,12 +314,14 @@ function wireTime(M, head) {
       g += `<path d="M${sc.map((y) => `${X(y.year)},${Y(y.range[1])}`).join('L')}L${[...sc].reverse().map((y) => `${X(y.year)},${Y(y.range[0])}`).join('L')}Z" class="bandref" opacity="0.8"/>`;
       g += `<path d="M${sc.map((y) => `${X(y.year)},${Y(y.percentile)}`).join('L')}" fill="none" stroke="var(--accent)" stroke-width="2.2"/>`;
       g += `<text x="${pad.l + 4}" y="${Y(50) - 5}" style="fill:var(--ink-2)">average</text>`;
-      g += sc.map((y) => `<circle cx="${X(y.year)}" cy="${Y(y.percentile)}" r="4" fill="var(--accent)"><title>${y.year}: better than ${y.percentile}% (likely ${ord(y.range[0])}–${ord(y.range[1])}), ${y.finds} finds</title></circle>
+      g += sc.map((y) => `<circle cx="${X(y.year)}" cy="${Y(y.percentile)}" r="4" fill="${y.few ? 'var(--surface)' : 'var(--accent)'}" stroke="var(--accent)" stroke-width="${y.few ? 2 : 0}"><title>${y.year}: better than ${y.percentile}% (likely ${ord(y.range[0])}–${ord(y.range[1])}), ${y.finds} finds${y.few ? ' (few finds, wide range)' : ''}</title></circle>
         <text x="${X(y.year)}" y="${Y(y.percentile) - 9}" text-anchor="middle" style="fill:var(--ink);font-weight:600">${y.percentile}</text>`).join('');
     }
     el.innerHTML = `<svg width="100%" viewBox="0 0 ${W} ${H}" role="img" aria-label="Your percentile by year">${g}</svg>`;
     const few = ys.filter((y) => y.percentile === undefined).map((y) => y.year);
-    $('#tnote').textContent = `Percentile among ListenBrainz listeners' years with at least ${META.min_year} finds. Blue band: likely range.` + (few.length ? ` Too few finds to score: ${few.join(', ')}.` : '');
+    const thin = sc.filter((y) => y.few).map((y) => y.year);
+    $('#tnote').textContent = `Percentile among ListenBrainz listeners' years with at least ${META.min_year} finds. Blue band: likely range.`
+      + (thin.length ? ` Hollow points (${thin.join(', ')}): fewer than ${META.min_year} finds that year, so the range is wide.` : '') + (few.length ? ` Too few finds to score (under 5): ${few.join(', ')}.` : '');
   };
   draw();
 }
